@@ -1,0 +1,9 @@
+alpaca-py==0.43.4
+pyodbc
+pandas
+numpy
+APScheduler
+python-dotenv
+pyyaml
+python-telegram-bot
+vectorbt

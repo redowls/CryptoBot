@@ -1,0 +1,17 @@
+strategy:
+  donchian_entry: 20
+  donchian_exit: 10
+  atr_period: 14
+  atr_stop_mult: 2.0
+
+risk:
+  risk_per_trade: 0.01
+  max_positions: 2
+  max_daily_loss_pct: 0.03
+  max_drawdown_pct: 0.15
+
+market:
+  pairs:
+    - BTC/USD
+    - ETH/USD
+  timeframe: 4Hour
