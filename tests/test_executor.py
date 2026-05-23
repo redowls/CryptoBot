@@ -161,6 +161,143 @@ def test_reconcile_handles_negative_qty():
     assert repo.upserts[0]["qty"] == pytest.approx(0.1)
 
 
+# ---------- close_position ----------
+# Bug context: Alpaca holds positions to 9+ decimal places, but our SQL
+# `positions.qty` is DECIMAL(28,8). Reconcile rounds Alpaca's value, and a
+# later SELL using the rounded SQL qty is rejected with HTTP 403 +
+# code:40310000 "insufficient balance" because the request exceeds the true
+# holding by a few satoshis. `close_position` delegates the qty decision to
+# Alpaca's own balance via TradingClient.close_position(symbol), bypassing
+# the round-trip through our DECIMAL column.
+
+
+class _OrderRepo:
+    """Capture insert_order / update_order_status calls for close_position tests."""
+    def __init__(self) -> None:
+        self.inserted: list[dict] = []
+        self.updated: list[dict] = []
+
+    def insert_order(self, **kwargs: Any) -> int:
+        self.inserted.append(kwargs)
+        return len(self.inserted)
+
+    def update_order_status(self, **kwargs: Any) -> int:
+        self.updated.append(kwargs)
+        return 1
+
+
+def _close_position_response(**overrides: Any) -> MagicMock:
+    """Build a fake alpaca-py Order returned from close_position()."""
+    raw = {
+        "id": "alpaca-order-xyz",
+        "client_order_id": "BTCUSD-20260523120000-abcdef",
+        "status": "accepted",
+        "filled_qty": "0",
+        "filled_avg_price": None,
+        "filled_at": None,
+    }
+    raw.update(overrides)
+    m = MagicMock()
+    m.model_dump.return_value = raw
+    return m
+
+
+def test_close_position_calls_trading_close_not_submit_order():
+    """The whole point of close_position: it must NOT pass a qty to Alpaca.
+
+    Using TradingClient.submit_order with qty=db_qty is what triggers the
+    dust-rounding 403. close_position(symbol) uses Alpaca's authoritative
+    balance internally — no qty arg.
+    """
+    repo = _OrderRepo()
+    fake_trading = MagicMock()
+    fake_trading.close_position.return_value = _close_position_response()
+    ex = Executor(repo=repo, trading_client=fake_trading)  # type: ignore[arg-type]
+
+    ex.close_position(symbol="BTC/USD", qty_hint=0.00012945, signal_id=42)
+
+    fake_trading.close_position.assert_called_once_with("BTC/USD")
+    fake_trading.submit_order.assert_not_called()
+
+
+def test_close_position_pre_inserts_orders_row_with_status_pending():
+    """Audit-trail invariant: orders row exists with status='pending' BEFORE the
+    API call, so a crash mid-flight still leaves something to recover from."""
+    repo = _OrderRepo()
+    fake_trading = MagicMock()
+    fake_trading.close_position.return_value = _close_position_response()
+    ex = Executor(repo=repo, trading_client=fake_trading)  # type: ignore[arg-type]
+
+    ex.close_position(symbol="BTC/USD", qty_hint=0.00012945, signal_id=42)
+
+    assert len(repo.inserted) == 1
+    row = repo.inserted[0]
+    assert row["symbol"] == "BTC/USD"
+    assert row["side"] == "SELL"
+    assert row["type"] == "market"
+    assert row["status"] == "pending"
+    assert row["signal_id"] == 42
+    # qty_hint flows into the orders row as audit context — we needed *some*
+    # number for the NOT NULL column. Real fill qty lands in filled_qty via
+    # update_order_status after the API responds.
+    assert float(row["qty"]) == pytest.approx(0.00012945)
+
+
+def test_close_position_updates_orders_row_with_alpaca_response():
+    repo = _OrderRepo()
+    fake_trading = MagicMock()
+    fake_trading.close_position.return_value = _close_position_response(
+        id="alpaca-order-zzz",
+        status="filled",
+        filled_qty="0.000129445",
+        filled_avg_price="75800.50",
+        filled_at="2026-05-23T12:00:01Z",
+    )
+    ex = Executor(repo=repo, trading_client=fake_trading)  # type: ignore[arg-type]
+
+    ex.close_position(symbol="BTC/USD", qty_hint=0.00012945)
+
+    assert len(repo.updated) == 1
+    upd = repo.updated[0]
+    assert upd["status"] == "filled"
+    assert upd["alpaca_order_id"] == "alpaca-order-zzz"
+    assert float(upd["filled_qty"]) == pytest.approx(0.000129445)
+    assert float(upd["filled_avg_price"]) == pytest.approx(75800.50)
+
+
+def test_close_position_returns_submitted_order():
+    repo = _OrderRepo()
+    fake_trading = MagicMock()
+    fake_trading.close_position.return_value = _close_position_response(
+        status="filled", filled_qty="0.000129445",
+    )
+    ex = Executor(repo=repo, trading_client=fake_trading)  # type: ignore[arg-type]
+
+    submitted = ex.close_position(symbol="BTC/USD", qty_hint=0.00012945)
+
+    assert submitted.symbol == "BTC/USD"
+    assert submitted.side == "SELL"
+    assert submitted.status == "filled"
+    assert submitted.alpaca_order_id == "alpaca-order-xyz"
+    assert submitted.client_order_id  # auto-generated
+
+
+def test_close_position_marks_orders_row_error_when_alpaca_raises():
+    """If close_position raises, the pre-inserted row must end up as 'error'
+    (not stuck in 'pending') so recovery sweeps can tell what happened."""
+    repo = _OrderRepo()
+    fake_trading = MagicMock()
+    fake_trading.close_position.side_effect = RuntimeError("403 forbidden")
+    ex = Executor(repo=repo, trading_client=fake_trading)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError):
+        ex.close_position(symbol="BTC/USD", qty_hint=0.00012945)
+
+    assert len(repo.inserted) == 1  # pre-insert still happened
+    assert len(repo.updated) == 1
+    assert repo.updated[0]["status"] == "error"
+
+
 # ---------- script mode: submit a real paper order ----------
 
 def _script_main() -> None:

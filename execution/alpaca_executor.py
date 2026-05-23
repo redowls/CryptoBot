@@ -157,6 +157,77 @@ class Executor:
             raw=raw,
         )
 
+    def close_position(
+        self,
+        symbol: str,
+        qty_hint: float | Decimal,
+        client_order_id: str | None = None,
+        signal_id: int | None = None,
+    ) -> SubmittedOrder:
+        """Close the full open position via TradingClient.close_position(symbol).
+
+        Why this exists instead of `submit_market_order(side='SELL', qty=db_qty)`:
+        our `positions.qty` is `DECIMAL(28,8)` but Alpaca tracks crypto holdings
+        to 9+ decimal places. Reconcile rounds Alpaca's value into 8dp; a later
+        SELL using the rounded qty exceeds the true holding by a few satoshis
+        and Alpaca rejects with HTTP 403 + code 40310000 "insufficient balance".
+        `close_position(symbol)` delegates the qty decision to Alpaca's own
+        balance, sidestepping the round-trip through our DECIMAL column.
+
+        `qty_hint` is recorded on the pre-submit `orders` row for audit (the
+        column is NOT NULL); the actual filled qty lands in `filled_qty` from
+        Alpaca's response.
+        """
+        coid = client_order_id or self.make_client_order_id(symbol)
+
+        self.repo.insert_order(
+            client_order_id=coid,
+            symbol=symbol,
+            side="SELL",
+            type="market",
+            qty=qty_hint,
+            status="pending",
+            signal_id=signal_id,
+        )
+
+        try:
+            order = self._trading.close_position(symbol)
+        except Exception as e:
+            log.exception("close_position failed for %s", symbol)
+            self.repo.update_order_status(
+                client_order_id=coid,
+                status="error",
+                raw_response=f"{type(e).__name__}: {e}",
+            )
+            raise
+
+        raw = _model_dump(order)
+        alpaca_id = str(raw.get("id")) if raw.get("id") is not None else None
+        status = str(_enum_value(raw.get("status", "new")))
+        filled_qty = raw.get("filled_qty")
+        filled_avg = raw.get("filled_avg_price")
+        filled_at = raw.get("filled_at")
+
+        self.repo.update_order_status(
+            client_order_id=coid,
+            status=status,
+            alpaca_order_id=alpaca_id,
+            filled_qty=_nonzero(filled_qty),
+            filled_avg_price=_nonzero(filled_avg),
+            filled_at=_parse_dt(filled_at),
+            raw_response=json.dumps(raw, default=str)[:8000],
+        )
+
+        return SubmittedOrder(
+            client_order_id=coid,
+            alpaca_order_id=alpaca_id,
+            symbol=symbol,
+            side="SELL",
+            qty=float(qty_hint),
+            status=status,
+            raw=raw,
+        )
+
     def cancel_all_open_orders(self, symbol: str) -> int:
         """Cancel every open order for `symbol`. Returns the count cancelled."""
         req = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])

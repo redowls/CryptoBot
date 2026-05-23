@@ -212,9 +212,18 @@ class Bot:
             log.warning("%s: computed qty=%s, skipping", symbol, qty)
             return
 
-        order = self.executor.submit_market_order(
-            symbol=symbol, qty=qty, side=sig.side, signal_id=signal_id,
-        )
+        if sig.side == "BUY":
+            order = self.executor.submit_market_order(
+                symbol=symbol, qty=qty, side="BUY", signal_id=signal_id,
+            )
+        else:
+            # SELL exits go through close_position so Alpaca decides the qty
+            # from its authoritative balance — sidesteps the DECIMAL(28,8)
+            # rounding bug where SQL qty drifts above Alpaca's actual holding
+            # by a few satoshis and triggers HTTP 403 / code 40310000.
+            order = self.executor.close_position(
+                symbol=symbol, qty_hint=qty, signal_id=signal_id,
+            )
         log.info("submitted %s %s qty=%s status=%s coid=%s",
                  sig.side, symbol, qty, order.status, order.client_order_id)
 

@@ -168,14 +168,19 @@ def test_stop_monitor_triggers_sell_when_bid_below_stop():
 
     order = MagicMock()
     order.raw = {"filled_avg_price": "47480"}
-    executor.submit_market_order.return_value = order
+    executor.close_position.return_value = order
 
     triggered = rm.monitor_stops()
 
     assert len(triggered) == 1
-    executor.submit_market_order.assert_called_once_with(
-        symbol="BTC/USD", qty=0.1, side="SELL",
+    # Stop exits MUST go through close_position (not submit_market_order) so
+    # Alpaca's authoritative balance is used and the dust-rounding 403 (CLAUDE.md
+    # "Execution / Pre-submit insert" section) can't recur. The SQL `qty` is
+    # passed as qty_hint for the audit trail only — Alpaca ignores it.
+    executor.close_position.assert_called_once_with(
+        symbol="BTC/USD", qty_hint=0.1,
     )
+    executor.submit_market_order.assert_not_called()
     repo.record_closed_trade.assert_called_once()
     repo.delete_position.assert_called_once_with("BTC/USD")
     # Realised exit price should reflect Alpaca's fill, not the pre-trade bid.
@@ -190,7 +195,7 @@ def test_stop_monitor_does_nothing_when_bid_above_stop():
     triggered = rm.monitor_stops()
 
     assert triggered == []
-    executor.submit_market_order.assert_not_called()
+    executor.close_position.assert_not_called()
     repo.delete_position.assert_not_called()
 
 
@@ -202,7 +207,7 @@ def test_stop_monitor_skips_position_with_no_stop():
 
     assert triggered == []
     data_client.get_latest_quote.assert_not_called()
-    executor.submit_market_order.assert_not_called()
+    executor.close_position.assert_not_called()
 
 
 def test_stop_monitor_handles_quote_failure():
@@ -213,7 +218,7 @@ def test_stop_monitor_handles_quote_failure():
     triggered = rm.monitor_stops()
 
     assert triggered == []
-    executor.submit_market_order.assert_not_called()
+    executor.close_position.assert_not_called()
     repo.log.assert_called()  # error was logged
 
 
@@ -231,10 +236,12 @@ def test_kill_switch_closes_all_and_invokes_callback():
     n = rm.trigger_kill_switch("test drawdown")
 
     assert n == 2
-    assert executor.submit_market_order.call_count == 2
-    # Both pairs should have a SELL submitted (callable with side='SELL').
-    sides = [c.kwargs["side"] for c in executor.submit_market_order.call_args_list]
-    assert sides == ["SELL", "SELL"]
+    # Kill-switch closes via close_position (same dust-rounding reasoning as
+    # stop monitor — Alpaca authoritative on qty).
+    assert executor.close_position.call_count == 2
+    executor.submit_market_order.assert_not_called()
+    symbols_closed = [c.kwargs["symbol"] for c in executor.close_position.call_args_list]
+    assert sorted(symbols_closed) == ["BTC/USD", "ETH/USD"]
     assert called == [True]
 
 
@@ -244,8 +251,8 @@ def test_kill_switch_is_idempotent():
     rm.trigger_kill_switch("first")
     n2 = rm.trigger_kill_switch("second")
     assert n2 == 0
-    # SELL only fired during the first call.
-    assert executor.submit_market_order.call_count == 1
+    # close_position only fired during the first call.
+    assert executor.close_position.call_count == 1
 
 
 if __name__ == "__main__":

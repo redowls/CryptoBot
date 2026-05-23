@@ -216,10 +216,10 @@ class RiskManager:
             if qty <= 0:
                 continue
             try:
-                self.executor.submit_market_order(symbol=symbol, qty=qty, side="SELL")
+                self.executor.close_position(symbol=symbol, qty_hint=qty)
                 closed += 1
             except Exception:
-                log.exception("kill switch SELL failed for %s", symbol)
+                log.exception("kill switch close_position failed for %s", symbol)
 
         if self.on_kill_switch:
             try:
@@ -274,14 +274,14 @@ class RiskManager:
             )
 
             try:
-                order = self.executor.submit_market_order(
-                    symbol=symbol, qty=qty, side="SELL",
+                order = self.executor.close_position(
+                    symbol=symbol, qty_hint=qty,
                 )
             except Exception as e:
-                log.exception("monitor_stops: SELL failed for %s", symbol)
+                log.exception("monitor_stops: close_position failed for %s", symbol)
                 self.repo.log(
                     "ERROR", "risk.manager.monitor_stops",
-                    f"{symbol} stop SELL failed", exc=e,
+                    f"{symbol} stop close failed", exc=e,
                 )
                 continue
 
