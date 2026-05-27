@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, Iterator, Sequence
 
@@ -37,9 +38,28 @@ class Database:
             "TrustServerCertificate=yes;"
         )
 
+    def _connect_with_retry(
+        self, attempts: int = 6, delay: float = 2.0
+    ) -> pyodbc.Connection:
+        last_exc: Exception | None = None
+        for i in range(attempts):
+            try:
+                return pyodbc.connect(self.connection_string, autocommit=False)
+            except pyodbc.ProgrammingError as e:
+                last_exc = e
+                msg = str(e)
+                # 4060: Cannot open database (DB still recovering after host reboot)
+                # 18456: Login failed (transient during SQL Server startup)
+                if ("4060" in msg or "18456" in msg) and i < attempts - 1:
+                    time.sleep(delay)
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
+
     @contextmanager
     def get_connection(self) -> Iterator[pyodbc.Connection]:
-        conn = pyodbc.connect(self.connection_string, autocommit=False)
+        conn = self._connect_with_retry()
         try:
             yield conn
             conn.commit()
